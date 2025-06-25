@@ -1,10 +1,11 @@
 import cv2
 import numpy as np
-import pyzed.sl as sl
 import math
+import argparse
+import os
 
 # Particle filter params
-MIN_PARTICLE_AREA = 15
+MIN_PARTICLE_AREA = 25
 MAX_PARTICLE_AREA = 200
 MIN_CIRCULARITY = 0.6
 MAX_CIRCULARITY = 0.95
@@ -46,27 +47,56 @@ def setup_blob_detector():
     return detector
 
 def detect_roi(image_bgr):
-    """Auto-detect black board ROI"""
+    """Auto-detect silver plate ROI"""
     global ROI_X, ROI_Y, ROI_WIDTH, ROI_HEIGHT
     
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
+    
+    # Use adaptive thresholding to better detect the silver plate
+    # Look for bright/light areas (silver plate) rather than dark areas
+    _, thresh = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)
+    
+    # Apply morphological operations to clean up the mask
+    kernel = np.ones((5,5), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     if contours:
-        largest_contour = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(largest_contour)
+        # Filter contours by area and aspect ratio to find the silver plate
+        valid_contours = []
+        image_area = image_bgr.shape[0] * image_bgr.shape[1]
         
-        ROI_X = x + ROI_MARGIN
-        ROI_Y = y + ROI_MARGIN
-        ROI_WIDTH = w - 2 * ROI_MARGIN
-        ROI_HEIGHT = h - 2 * ROI_MARGIN
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # Filter by area (should be a significant portion but not the whole image)
+            if area > image_area * 0.05 and area < image_area * 0.8:
+                # Filter by aspect ratio (roughly rectangular plate)
+                aspect_ratio = w / h
+                if 0.5 < aspect_ratio < 3.0:  # Reasonable aspect ratio for a plate
+                    # Filter by dimensions (should be reasonably sized)
+                    if w > 100 and h > 100:
+                        valid_contours.append((contour, area))
         
-        return (ROI_X, ROI_Y, ROI_WIDTH, ROI_HEIGHT)
+        if valid_contours:
+            # Get the largest valid contour (most likely the silver plate)
+            largest_contour = max(valid_contours, key=lambda x: x[1])[0]
+            x, y, w, h = cv2.boundingRect(largest_contour)
+            
+            ROI_X = x + ROI_MARGIN
+            ROI_Y = y + ROI_MARGIN
+            ROI_WIDTH = w - 2 * ROI_MARGIN
+            ROI_HEIGHT = h - 2 * ROI_MARGIN
+            
+            return (ROI_X, ROI_Y, ROI_WIDTH, ROI_HEIGHT)
+    
     return None
 
 def detect_particles_and_sample_color(image_bgr, detector, depth_map=None, point_cloud=None, roi=None):
-    """Detect blobs and get colors + positions"""
+    """Detect blobs and get colors + positions (modified to work without ZED depth data)"""
     detected_list = []
     height, width = image_bgr.shape[:2]
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
@@ -98,12 +128,8 @@ def detect_particles_and_sample_color(image_bgr, detector, depth_map=None, point
             pixel_lab = cv2.cvtColor(pixel_bgr, cv2.COLOR_BGR2LAB)
             color_lab = tuple(map(int, pixel_lab[0, 0]))
             
+            # Since we don't have ZED depth data, set world_pos to None
             world_pos = None
-            if depth_map is not None and point_cloud is not None:
-                if 0 <= cY < depth_map.get_height() and 0 <= cX < depth_map.get_width():
-                    err, world_pos = point_cloud.get_value(cX, cY)
-                    if err != sl.ERROR_CODE.SUCCESS:
-                        world_pos = None
 
             detected_list.append(((cX, cY), color_bgr, color_lab, world_pos))
     return detected_list
@@ -193,195 +219,372 @@ def draw_detections(image, particles_list, displacements_map=None, roi=None):
 
         if displacements_map and centroid in displacements_map:
             dx, dy = displacements_map[centroid]
-            end_point = (cx + dx, cy + dy)
-            cv2.arrowedLine(vis_image, (cx, cy), end_point, (0, 0, 0), 3, tipLength=0.3)
-            cv2.arrowedLine(vis_image, (cx, cy), end_point, (255, 255, 255), 1, tipLength=0.3)
+            # Convert to integers for OpenCV drawing functions
+            end_point = (int(cx + dx), int(cy + dy))
+            start_point = (int(cx), int(cy))
+            cv2.arrowedLine(vis_image, start_point, end_point, (0, 0, 0), 3, tipLength=0.3)
+            cv2.arrowedLine(vis_image, start_point, end_point, (255, 255, 255), 1, tipLength=0.3)
 
     return vis_image
 
-def main():
-    blob_detector = setup_blob_detector()
-    zed = sl.Camera()
-    init_params = sl.InitParameters()
-    init_params.coordinate_units = sl.UNIT.METER
-    init_params.camera_resolution = sl.RESOLUTION.HD720
-    init_params.camera_fps = 30
-    init_params.depth_mode = sl.DEPTH_MODE.ULTRA
-    status = zed.open(init_params)
-    if status != sl.ERROR_CODE.SUCCESS:
-        print(f"Camera Open failed: {status}")
-        zed.close()
-        exit(1)
-    cam_info = zed.get_camera_information()
-    resolution = cam_info.camera_configuration.resolution
+def get_frames_from_video(video_path, frame_interval_seconds=1.0):
+    """Extract two frames from video separated by specified interval"""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video file: {video_path}")
     
-    image_zed = sl.Mat(resolution.width, resolution.height, sl.MAT_TYPE.U8_C4)
-    depth_zed = sl.Mat(resolution.width, resolution.height, sl.MAT_TYPE.F32_C1)
-    point_cloud = sl.Mat(resolution.width, resolution.height, sl.MAT_TYPE.F32_C4)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_interval = int(fps * frame_interval_seconds)
     
-    start_image = None
-    start_particles = []
-    end_particles = []
-    start_frame_captured = False
-    start_vis_image = None
-    results_calculated = False
+    # Read first frame
+    ret, start_frame = cap.read()
+    if not ret:
+        raise ValueError("Cannot read first frame from video")
+    
+    # Skip frames to get the second frame
+    for _ in range(frame_interval):
+        ret, end_frame = cap.read()
+        if not ret:
+            # If we can't skip enough frames, use the last available frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, cap.get(cv2.CAP_PROP_FRAME_COUNT) - 1)
+            ret, end_frame = cap.read()
+            if not ret:
+                raise ValueError("Cannot read end frame from video")
+            break
+    
+    cap.release()
+    return start_frame, end_frame
+
+def get_image_sequence(folder_path):
+    """Get sorted list of image files from folder"""
+    import glob
+    
+    # Common image extensions
+    extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.tif']
+    
+    image_files = []
+    for ext in extensions:
+        image_files.extend(glob.glob(os.path.join(folder_path, ext)))
+        image_files.extend(glob.glob(os.path.join(folder_path, ext.upper())))
+    
+    if not image_files:
+        raise ValueError(f"No image files found in folder: {folder_path}")
+    
+    # Sort files naturally (handles numeric sequences properly)
+    image_files.sort()
+    
+    return image_files
+
+def process_image_sequence(image_files, blob_detector):
+    """Process sequence of images and accumulate displacement vectors"""
+    if len(image_files) < 2:
+        raise ValueError("Need at least 2 images for sequence processing")
+    
+    print(f"Processing sequence of {len(image_files)} images...")
+    
+    # Load first image to establish base
+    base_image = cv2.imread(image_files[0])
+    if base_image is None:
+        raise ValueError(f"Cannot load image: {image_files[0]}")
+    
+    # Auto-detect ROI from first image
     roi = None
-    window_live = "ZED Live Feed"
-    window_start_detections = "Start Frame Detections"
-    print("Camera Initialized. Press 's' -> move particles -> 'e'. 'r' to reset, 'q' to quit.")
-    print(f"Using Lab Color Matching Threshold: {LAB_MATCH_THRESHOLD}")
-    print(f"Maximum Displacement Constraints: {MAX_DISPLACEMENT_PIXELS} pixels, {MAX_DISPLACEMENT_MM} mm")
+    if AUTO_DETECT_ROI:
+        roi = detect_roi(base_image)
+        if roi:
+            print(f"ROI detected: {roi}")
+    
+    # Accumulate all displacement vectors
+    all_displacements = {}  # Dictionary to store all displacement vectors
+    sequence_info = []  # Store info about each pair processed
+    
+    for i in range(len(image_files) - 1):
+        print(f"\nProcessing pair {i+1}/{len(image_files)-1}: {os.path.basename(image_files[i])} -> {os.path.basename(image_files[i+1])}")
+        
+        # Load consecutive images
+        img1 = cv2.imread(image_files[i])
+        img2 = cv2.imread(image_files[i+1])
+        
+        if img1 is None or img2 is None:
+            print(f"Warning: Could not load image pair {i+1}, skipping...")
+            continue
+        
+        # Detect particles in both images
+        particles1 = detect_particles_and_sample_color(img1, blob_detector, roi=roi)
+        particles2 = detect_particles_and_sample_color(img2, blob_detector, roi=roi)
+        
+        print(f"  Found {len(particles1)} -> {len(particles2)} particles")
+        
+        # Match particles
+        matched_pairs, unmatched_start, unmatched_end = match_particles(
+            particles1, particles2, 
+            LAB_MATCH_THRESHOLD, 
+            MAX_DISPLACEMENT_PIXELS, 
+            None
+        )
+        
+        print(f"  Matched {len(matched_pairs)} particles")
+        
+        # Add displacement vectors to accumulation
+        pair_displacements = {}
+        for start_p, end_p in matched_pairs:
+            start_pos, start_color_bgr, _, _ = start_p
+            end_pos, _, _, _ = end_p
+            sx, sy = start_pos
+            ex, ey = end_pos
+            dx = ex - sx
+            dy = ey - sy
+            
+            pair_displacements[start_pos] = (dx, dy)
+            
+            # Add to global accumulation (you could weight by color similarity, etc.)
+            if start_pos in all_displacements:
+                # Average with existing displacement
+                old_dx, old_dy = all_displacements[start_pos]
+                all_displacements[start_pos] = ((old_dx + dx) / 2, (old_dy + dy) / 2)
+            else:
+                all_displacements[start_pos] = (dx, dy)
+        
+        sequence_info.append({
+            'pair': f"{os.path.basename(image_files[i])} -> {os.path.basename(image_files[i+1])}",
+            'matches': len(matched_pairs),
+            'displacements': pair_displacements
+        })
+    
+    print(f"\n--- Sequence Processing Complete ---")
+    print(f"Total unique displacement vectors accumulated: {len(all_displacements)}")
+    
+    # Get all particles from the base image for visualization
+    base_particles = detect_particles_and_sample_color(base_image, blob_detector, roi=roi)
+    
+    # Create final visualization
+    final_vis = draw_detections(base_image, base_particles, all_displacements, roi)
+    
+    return final_vis, base_image, all_displacements, sequence_info
 
-    while True:
-        err = zed.grab()
-        if err == sl.ERROR_CODE.SUCCESS:
-            zed.retrieve_image(image_zed, sl.VIEW.LEFT, sl.MEM.CPU, resolution)
-            zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH, sl.MEM.CPU, resolution)
-            zed.retrieve_measure(point_cloud, sl.MEASURE.XYZRGBA, sl.MEM.CPU, resolution)
+def resize_image_for_display(image, max_width=1200, max_height=800):
+    """Resize image for display if it's too large, maintaining aspect ratio"""
+    height, width = image.shape[:2]
+    
+    # Calculate scaling factor
+    scale_w = max_width / width
+    scale_h = max_height / height
+    scale = min(scale_w, scale_h, 1.0)  # Don't upscale, only downscale
+    
+    if scale < 1.0:
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        return resized, scale
+    
+    return image, 1.0
+
+def process_images(start_image, end_image, blob_detector):
+    """Process start and end images to detect particles and calculate displacement"""
+    roi = None
+    
+    # Auto-detect ROI from start image if enabled
+    if AUTO_DETECT_ROI:
+        roi = detect_roi(start_image)
+        if roi:
+            print(f"ROI detected: {roi}")
+    
+    print("Detecting particles in start image...")
+    start_particles = detect_particles_and_sample_color(start_image, blob_detector, roi=roi)
+    print(f" -> Found {len(start_particles)} blobs in start frame.")
+    
+    print("Detecting particles in end image...")
+    end_particles = detect_particles_and_sample_color(end_image, blob_detector, roi=roi)
+    print(f" -> Found {len(end_particles)} blobs in end frame.")
+    
+    print("\nMatching particles using Lab color distance and spatial constraints...")
+    matched_pairs, unmatched_start, unmatched_end = match_particles(
+        start_particles, end_particles, 
+        LAB_MATCH_THRESHOLD, 
+        MAX_DISPLACEMENT_PIXELS, 
+        None  # No 3D distance constraint since we don't have depth data
+    )
+    
+    # Calculate and display results
+    displacement_data = {}
+    print("\n--- Displacement Results ---")
+    if not matched_pairs:
+        print("No matching particles found.")
+    else:
+        print(f"{len(matched_pairs)} particle(s) matched:")
+        for i, (start_p, end_p) in enumerate(matched_pairs):
+            start_pos, start_color_bgr, _, _ = start_p
+            end_pos, _, _, _ = end_p
+            sx, sy = start_pos
+            ex, ey = end_pos
+            dx = ex - sx
+            dy = ey - sy
             
-            frame_bgra = image_zed.get_data()
-            current_frame_bgr = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
-            display_feed = current_frame_bgr.copy()
+            displacement_data[start_pos] = (dx, dy)
+            pixel_distance = math.sqrt(dx**2 + dy**2)
+            print(f"  Match {i+1}: Start@{start_pos} [Color(BGR):{start_color_bgr}] -> End@{end_pos} | Disp=({dx}, {dy}) px | Distance: {pixel_distance:.1f} px")
+    
+    if unmatched_start:
+        print(f"\n{len(unmatched_start)} unmatched start particle(s):")
+        for i, p in enumerate(unmatched_start):
+             print(f"  Unmatched Start {i+1}: Pos={p[0]}, Color(BGR)={p[1]}")
+    if unmatched_end:
+        print(f"\n{len(unmatched_end)} unmatched end particle(s):")
+        for i, p in enumerate(unmatched_end):
+             print(f"  Unmatched End {i+1}: Pos={p[0]}, Color(BGR)={p[1]}")
+    print("-----------------------------")
+    
+    # Save images
+    cv2.imwrite("start_image.png", start_image)
+    cv2.imwrite("end_image.png", end_image)
+    print("Saved start_image.png and end_image.png")
+    
+    # Create visualization
+    start_vis_image = draw_detections(start_image, start_particles, displacement_data, roi)
+    end_vis_image = draw_detections(end_image, end_particles, roi=roi)
+    
+    return start_vis_image, end_vis_image, matched_pairs
+
+def main():
+    parser = argparse.ArgumentParser(description='Image processing for particle displacement analysis')
+    parser.add_argument('--mode', choices=['images', 'video', 'sequence'], required=True,
+                        help='Processing mode: "images" for start/end image files, "video" for video file, "sequence" for image sequence in folder')
+    parser.add_argument('--start', type=str, help='Path to start image (required for images mode)')
+    parser.add_argument('--end', type=str, help='Path to end image (required for images mode)')
+    parser.add_argument('--video', type=str, help='Path to video file (required for video mode)')
+    parser.add_argument('--folder', type=str, help='Path to folder containing image sequence (required for sequence mode)')
+    parser.add_argument('--interval', type=float, default=1.0, 
+                        help='Time interval in seconds between frames for video mode (default: 1.0)')
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.mode == 'images':
+        if not args.start or not args.end:
+            print("Error: --start and --end are required for images mode")
+            return
+        if not os.path.exists(args.start):
+            print(f"Error: Start image file not found: {args.start}")
+            return
+        if not os.path.exists(args.end):
+            print(f"Error: End image file not found: {args.end}")
+            return
+    elif args.mode == 'video':
+        if not args.video:
+            print("Error: --video is required for video mode")
+            return
+        if not os.path.exists(args.video):
+            print(f"Error: Video file not found: {args.video}")
+            return
+    elif args.mode == 'sequence':
+        if not args.folder:
+            print("Error: --folder is required for sequence mode")
+            return
+        if not os.path.exists(args.folder):
+            print(f"Error: Folder not found: {args.folder}")
+            return
+        if not os.path.isdir(args.folder):
+            print(f"Error: Path is not a directory: {args.folder}")
+            return
+    
+    blob_detector = setup_blob_detector()
+    
+    try:
+        if args.mode == 'images':
+            print(f"Loading images: {args.start} and {args.end}")
+            start_image = cv2.imread(args.start)
+            end_image = cv2.imread(args.end)
             
-            if AUTO_DETECT_ROI and roi is None:
-                roi = detect_roi(current_frame_bgr)
-                if roi:
-                    print(f"ROI detected: {roi}")
+            if start_image is None:
+                print(f"Error: Cannot load start image: {args.start}")
+                return
+            if end_image is None:
+                print(f"Error: Cannot load end image: {args.end}")
+                return
             
-            if roi:
-                roi_x, roi_y, roi_w, roi_h = roi
-                cv2.rectangle(display_feed, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (0, 255, 0), 2)
+            # Process the images
+            start_vis, end_vis, matches = process_images(start_image, end_image, blob_detector)
             
-            status_text = ""
-            if not start_frame_captured:
-                 status_text = "Press 's' to capture start frame."
-            elif not results_calculated:
-                status_text = "Start captured. Move particles. Press 'e' for end."
-            else:
-                 status_text = "Displacement calculated (console). Press 'r' to reset."
-            cv2.putText(display_feed, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            if start_frame_captured:
-                 cv2.putText(display_feed, f"Start: {len(start_particles)} found", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            if results_calculated:
-                 cv2.putText(display_feed, f"End: {len(end_particles)} found", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            cv2.imshow(window_live, display_feed)
-        else:
-            print(f"Failed to grab frame: {err}. Exiting.")
-            break
-        key = cv2.waitKey(10) & 0xFF
-        if key == ord("q"):
-            print("Quitting.")
-            break
-        elif key == ord("r"):
-            print("Resetting capture.")
-            start_image = None
-            start_particles = []
-            end_particles = []
-            start_frame_captured = False
-            start_vis_image = None
-            results_calculated = False
-            try: cv2.destroyWindow(window_start_detections)
-            except cv2.error: pass
-            print("Press 's' to capture start frame.")
-        elif key == ord("s"):
-            if not start_frame_captured or results_calculated:
-                 if results_calculated:
-                     print("Resetting for new capture...")
-                     start_image = None
-                     start_particles = []
-                     end_particles = []
-                     start_frame_captured = False
-                     start_vis_image = None
-                     results_calculated = False
-                     try: cv2.destroyWindow(window_start_detections)
-                     except cv2.error: pass
-                 start_image = current_frame_bgr.copy()
-                 print("Start frame captured. Detecting particles...")
-                 
-                 start_particles = detect_particles_and_sample_color(
-                     start_image, blob_detector, depth_zed, point_cloud, roi
-                 )
-                 print(f" -> Found {len(start_particles)} blobs in start frame.")
-                 start_frame_captured = True
-                 results_calculated = False
-                 if start_image is not None:
-                     start_vis_image = draw_detections(start_image, start_particles, roi=roi)
-                     cv2.imshow(window_start_detections, start_vis_image)
-                     print(f"Displaying start detections in '{window_start_detections}'.")
-                 print("Move particles and press 'e' to capture end frame and calculate displacement.")
-            else:
-                 print("Start frame already captured. Move particles and press 'e' or press 'r' to reset.")
-        elif key == ord("e"):
-            if start_frame_captured and not results_calculated:
-                end_image_capture = current_frame_bgr.copy()
-                print("End frame captured. Detecting particles...")
+            # Resize images for display if they're too large
+            start_display, start_scale = resize_image_for_display(start_vis)
+            end_display, end_scale = resize_image_for_display(end_vis)
+            
+            # Display results
+            print(f"\nDisplaying results. Found {len(matches)} particle matches.")
+            if start_scale < 1.0 or end_scale < 1.0:
+                print(f"Images resized for display: Start={start_scale:.2f}x, End={end_scale:.2f}x")
+            print("Press any key to close windows and exit.")
+            
+            # Create resizable windows
+            cv2.namedWindow("Start Frame with Displacement Vectors", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("End Frame Detections", cv2.WINDOW_NORMAL)
+            
+            cv2.imshow("Start Frame with Displacement Vectors", start_display)
+            cv2.imshow("End Frame Detections", end_display)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
                 
-                end_particles = detect_particles_and_sample_color(
-                    end_image_capture, blob_detector, depth_zed, point_cloud, roi
-                )
-                print(f" -> Found {len(end_particles)} blobs in end frame.")
-                print("\nMatching particles using Lab color distance and spatial constraints...")
-                matched_pairs, unmatched_start, unmatched_end = match_particles(
-                    start_particles, end_particles, 
-                    LAB_MATCH_THRESHOLD, 
-                    MAX_DISPLACEMENT_PIXELS, 
-                    MAX_DISPLACEMENT_MM
-                )
-                results_calculated = True
-
-                displacement_data = {}
-                print("\n--- Displacement Results ---")
-                if not matched_pairs:
-                    print("No matching particles found.")
-                else:
-                    print(f"{len(matched_pairs)} particle(s) matched:")
-                    for i, (start_p, end_p) in enumerate(matched_pairs):
-                        start_pos, start_color_bgr, _, start_world = start_p
-                        end_pos, _, _, end_world = end_p
-                        sx, sy = start_pos
-                        ex, ey = end_pos
-                        dx = ex - sx
-                        dy = ey - sy
-                        
-                        world_disp_str = "N/A"
-                        if start_world is not None and end_world is not None:
-                            dx_mm = (end_world[0] - start_world[0]) * 1000
-                            dy_mm = (end_world[1] - start_world[1]) * 1000
-                            dz_mm = (end_world[2] - start_world[2]) * 1000
-                            dist_mm = math.sqrt(dx_mm**2 + dy_mm**2 + dz_mm**2)
-                            world_disp_str = f"3D: ({dx_mm:.1f}, {dy_mm:.1f}, {dz_mm:.1f}) mm, Dist: {dist_mm:.1f} mm"
-                        
-                        displacement_data[start_pos] = (dx, dy)
-                        print(f"  Match {i+1}: Start@{start_pos} [Color(BGR):{start_color_bgr}] -> End@{end_pos} | Disp=({dx}, {dy}) px | {world_disp_str}")
-                if unmatched_start:
-                    print(f"\n{len(unmatched_start)} unmatched start particle(s):")
-                    for i, p in enumerate(unmatched_start):
-                         print(f"  Unmatched Start {i+1}: Pos={p[0]}, Color(BGR)={p[1]}")
-                if unmatched_end:
-                    print(f"\n{len(unmatched_end)} unmatched end particle(s):")
-                    for i, p in enumerate(unmatched_end):
-                         print(f"  Unmatched End {i+1}: Pos={p[0]}, Color(BGR)={p[1]}")
-                print("-----------------------------")
-                print("Displaying vectors on start image. Press 'r' to start a new measurement.")
-
-                if start_image is not None:
-                    cv2.imwrite("start_image.png", start_image)
-                    print("Saved start_image.png")
-                if end_image_capture is not None:
-                    cv2.imwrite("end_image.png", end_image_capture)
-                    print("Saved end_image.png")
-
-                if start_image is not None:
-                    start_vis_image = draw_detections(start_image, start_particles, displacement_data, roi)
-                    cv2.imshow(window_start_detections, start_vis_image)
-
-            elif not start_frame_captured:
-                print("Cannot calculate displacement. Capture start frame ('s') first.")
-            else:
-                print("Displacement already calculated. Press 'r' to reset for a new measurement.")
-    cv2.destroyAllWindows()
-    zed.close()
-    print("ZED camera closed.")
+        elif args.mode == 'video':
+            print(f"Extracting frames from video: {args.video} (interval: {args.interval}s)")
+            start_image, end_image = get_frames_from_video(args.video, args.interval)
+            
+            # Process the images
+            start_vis, end_vis, matches = process_images(start_image, end_image, blob_detector)
+            
+            # Resize images for display if they're too large
+            start_display, start_scale = resize_image_for_display(start_vis)
+            end_display, end_scale = resize_image_for_display(end_vis)
+            
+            # Display results
+            print(f"\nDisplaying results. Found {len(matches)} particle matches.")
+            if start_scale < 1.0 or end_scale < 1.0:
+                print(f"Images resized for display: Start={start_scale:.2f}x, End={end_scale:.2f}x")
+            print("Press any key to close windows and exit.")
+            
+            # Create resizable windows
+            cv2.namedWindow("Start Frame with Displacement Vectors", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("End Frame Detections", cv2.WINDOW_NORMAL)
+            
+            cv2.imshow("Start Frame with Displacement Vectors", start_display)
+            cv2.imshow("End Frame Detections", end_display)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+            
+        elif args.mode == 'sequence':
+            print(f"Processing image sequence from folder: {args.folder}")
+            image_files = get_image_sequence(args.folder)
+            print(f"Found {len(image_files)} images in sequence")
+            
+            # Process the sequence
+            final_vis, base_image, all_displacements, sequence_info = process_image_sequence(image_files, blob_detector)
+            
+            # Print sequence summary
+            print(f"\n--- Sequence Summary ---")
+            for info in sequence_info:
+                print(f"  {info['pair']}: {info['matches']} matches")
+            
+            # Save result
+            output_filename = f"sequence_displacement_field.png"
+            cv2.imwrite(output_filename, final_vis)
+            print(f"\nSaved cumulative displacement field to: {output_filename}")
+            
+            # Resize for display
+            display_image, scale = resize_image_for_display(final_vis)
+            
+            # Display results
+            print(f"\nDisplaying cumulative displacement field with {len(all_displacements)} vectors.")
+            if scale < 1.0:
+                print(f"Image resized for display: {scale:.2f}x")
+            print("Press any key to close window and exit.")
+            
+            # Create resizable window
+            cv2.namedWindow("Cumulative Displacement Field", cv2.WINDOW_NORMAL)
+            cv2.imshow("Cumulative Displacement Field", display_image)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        
+    except Exception as e:
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
